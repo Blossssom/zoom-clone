@@ -1,6 +1,7 @@
 import express from "express";
 import http from 'http';
-import WebSocket from "ws";
+import {Server} from 'socket.io';
+import {instrument} from '@socket.io/admin-ui'
 
 const app = express();
 const port = 3011;
@@ -13,39 +14,76 @@ app.get('/', (req, res) => res.render("home"));
 app.get('/*', (req, res) => res.redirect('/'));
 
 const server = http.createServer(app);
-const wss = new WebSocket.Server({server});
-// webSocket은 브라우저와 서버사이의 연결이다.
-// server, wss 가 같은 port 안에서 동작하길 원하기 때문에 위처럼 작성하지만 필수적인 요소는 아니다.
-// 둘 중 하나만 특히 ws 만 실행시키고 싶은 경우 http 서버를 따로 만들어줄 이유는 없다.
-// http 서버로 페이지를 표출하고 ws 서버를 같은 port에서 처리할 수 있도록 지정
+const socketServer = new Server(server, {
+    cors: {
+      origin: ["https://admin.socket.io"],
+      credentials: true
+    }
+  });
 
-const sockets = [];
-// client 간 message 전송을 위해 임시로 만든 db
-
-wss.on("connection", (socket) => {
-    sockets.push(socket);
-    socket['nickname'] = 'Anonymous';
-    socket.on("close", () => console.log("Disconnected Browser"));
-    // 브라우저 탭을 닫아 연결이 끊길 시 이벤트 발생
-
-    socket.on('message', (msg) => {
-        const jsonMessage = JSON.parse(msg);
-        switch(jsonMessage.type) {
-            case "newMessage":
-                sockets.forEach(v => v.send(`${socket.nickname} : ${jsonMessage.payload}`));
-            case "nickname":
-                socket["nickname"] = jsonMessage.payload;
-                // socket 데이터 또한 객체이기 때문에 위 처럼 값을 넣을 수 있다.
-        }
-        // 임시 db에 저장된 client 전체에 message 전송
-    });
-    // 현재 webSocket은 각각의 브라우저에 대해 개별적으로 작동하고 있어 브라우저간 message를 주고받지 못한다.
+instrument(socketServer, {
+    auth: false,
 });
-// 현재 js 파일인 server의 socket은 연결된 브라우저를 뜻하며 client에 존재하는 socket은 서버로의 연결을 뜻한다.
-// webSocket은 event를 사용하여 각각의 동작을 지정할 수 있다.
-// on() method는 이벤트가 발생하길 기다리며 위의 경우 connection이 이뤄졌을 경우 작동한다.
-// on() method는 backend에 연결된 사람의 정보를 제공하며 콜백에서 받은 socket에 지정된다.
-// connection 이벤트가 없어도 클라이언트와 실제 연결은 되기 때문에 다른 동작이 없다면 필수는 아니다.
+
+const publicRooms = () => {
+    const {sids, rooms} = socketServer.sockets.adapter;
+    const publicRoom = [];
+    rooms.forEach((_, key) => {
+        if(sids.get(key) === undefined) {
+            publicRoom.push(key);
+        }
+    });
+    return publicRoom;
+};
+// private room 을 제외한 public room 만을 반환하는 함수 작성
+
+const countRooms = (roomName) => {
+    return socketServer.sockets.adapter.rooms.get(roomName)?.size;
+};
+// 방의 참가중인 유저의 수를 반환하는 함수 작성
+
+socketServer.on("connection", (socket) => {
+    socket['nickname'] = 'Anonymous';
+    socket.onAny((event) => {
+        console.log(socketServer.sockets.adapter);
+        console.log(`Socket Event : ${event}`);
+    });
+    // onAny()는 모든 이벤트가 발생 시 실행된다. 
+
+    socket.on('enter_room', (roomName, done) => {
+        socket.join(roomName);
+        done(`inner ${roomName}`);
+        socketServer.to(roomName).emit("welcome", socket.nickname, countRooms(roomName));
+        // socket.to(roomName).emit("welcome", socket.nickname, countRooms(roomName));
+        // to(roomname) 으로 방을 지정할 수 있으며, 뒤에 이어올 emit() method로 이벤트를 발생시킬 수 있다.
+        socketServer.sockets.emit("roomChange", publicRooms());
+        // 방에 입장할 때 모든 서버내 사용자에게 공지
+    }); 
+
+    socket.on('disconnecting', () => {
+        socket.rooms.forEach(room => socket.to(room).emit("bye", socket.nickname, countRooms(room - 1)));
+        // 접속이 끊어졌을 때 각 방에 message를 전달한다. rooms의 반환 값이 Set이기 때문에 forEach 사용이 가능하다.
+    });
+    // disconnecting은 disconnection과 달리 연결이 아예 끊어진 것이 아닌 접속이 끊겼음을 이야기하므로 방을 완전히 나간게 아니다.
+
+    socket.on('disconnect', () => {
+        socketServer.sockets.emit("roomChange", publicRooms());
+    });
+    // disconnecting 에서 변경된 room을 넘길경우 방이 사라지기 직전에 동작하기 때문에 아무도 접속하지 않은 방도 포함하기 때문에
+    // 완전히 연결이 끊겼을 때 동작하는 disconnect에서 실행한다.
+
+    socket.on('new_message', (msg, room, done) => {
+        socket.to(room).emit('send_message', `${socket.nickname} : ${msg}`);
+        done();
+    });
+    // client 에서 받아온 message를 다른 참여자에게 전달한다.
+
+    socket.on('setNickName', nickname => {
+        socket['nickname'] = nickname;
+    });
+
+});
+
 
 server.listen(port, () => {
     console.log(`server on!!! http://localhost:3011/`);
